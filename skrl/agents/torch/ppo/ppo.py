@@ -383,47 +383,34 @@ class PPO(Agent):
             ):
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    sampled_observations_raw = sampled_observations
+                    sampled_states_raw = sampled_states
                     inputs = {
                         "observations": self._observation_preprocessor(sampled_observations, train=not epoch),
                         "states": self._state_preprocessor(sampled_states, train=not epoch),
                     }
 
-                    _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
-                    next_log_prob = outputs["log_prob"]
-
-                    # compute approximate KL divergence
-                    with torch.no_grad():
-                        ratio = next_log_prob - sampled_log_prob
-                        kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
-                        kl_divergences.append(kl_divergence)
+                    policy_loss, kl_divergence, entropy_loss, _ = self._compute_policy_loss(
+                        inputs=inputs,
+                        sampled_observations_raw=sampled_observations_raw,
+                        sampled_states_raw=sampled_states_raw,
+                        sampled_actions=sampled_actions,
+                        sampled_log_prob=sampled_log_prob,
+                        sampled_advantages=sampled_advantages,
+                    )
+                    kl_divergences.append(kl_divergence)
 
                     # early stopping with KL divergence
                     if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
                         break
 
-                    # compute entropy loss
-                    if self.cfg.entropy_loss_scale:
-                        entropy_loss = -self.cfg.entropy_loss_scale * self.policy.get_entropy(role="policy").mean()
-                    else:
-                        entropy_loss = 0
-
-                    # compute policy loss
-                    ratio = torch.exp(next_log_prob - sampled_log_prob)
-                    surrogate = sampled_advantages * ratio
-                    surrogate_clipped = sampled_advantages * torch.clip(
-                        ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+                    value_loss = self._compute_value_loss(
+                        inputs=inputs,
+                        sampled_observations_raw=sampled_observations_raw,
+                        sampled_states_raw=sampled_states_raw,
+                        sampled_values=sampled_values,
+                        sampled_returns=sampled_returns,
                     )
-
-                    policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
-
-                    # compute value loss
-                    predicted_values, _ = self.value.act(inputs, role="value")
-
-                    if self.cfg.value_clip > 0:
-                        predicted_values = sampled_values + torch.clip(
-                            predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
-                        )
-                    value_loss = self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
 
                 # optimization step
                 self.optimizer.zero_grad()
@@ -476,5 +463,97 @@ class PPO(Agent):
 
         self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
 
+        self._get_additional_value_metrics(last_values)
+
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
+
+    def _compute_policy_loss(
+        self,
+        *,
+        inputs: dict[str, torch.Tensor],
+        sampled_observations_raw: torch.Tensor,
+        sampled_states_raw: torch.Tensor,
+        sampled_actions: torch.Tensor,
+        sampled_log_prob: torch.Tensor,
+        sampled_advantages: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | float", torch.Tensor]:
+        """Compute the PPO surrogate policy loss, KL divergence, and entropy loss.
+
+        Returns ``(policy_loss, kl_divergence, entropy_loss, next_log_prob)``.
+        """
+        _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
+        next_log_prob = outputs["log_prob"]
+
+        with torch.no_grad():
+            ratio = next_log_prob - sampled_log_prob
+            kl_divergence = ((torch.exp(ratio) - 1) - ratio).mean()
+
+        if self.cfg.entropy_loss_scale:
+            entropy_loss = -self.cfg.entropy_loss_scale * self.policy.get_entropy(role="policy").mean()
+        else:
+            entropy_loss = 0
+
+        ratio = torch.exp(next_log_prob - sampled_log_prob)
+        surrogate = sampled_advantages * ratio
+        surrogate_clipped = sampled_advantages * torch.clip(
+            ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
+        )
+        policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
+
+        return policy_loss, kl_divergence, entropy_loss, next_log_prob
+
+    def _compute_value_loss(
+        self,
+        *,
+        inputs: dict[str, torch.Tensor],
+        sampled_observations_raw: torch.Tensor,
+        sampled_states_raw: torch.Tensor,
+        sampled_values: torch.Tensor,
+        sampled_returns: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the PPO value loss (clipped MSE against bootstrapped returns)."""
+        predicted_values, _ = self.value.act(inputs, role="value")
+
+        if self.cfg.value_clip > 0:
+            predicted_values = sampled_values + torch.clip(
+                predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
+            )
+        return self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
+
+    def _get_additional_value_metrics(self, last_values: torch.Tensor) -> None:
+        """Track value prediction vs true discounted return correlation.
+
+        Computes the forward-looking discounted return over the rollout
+        horizon and reports Pearson correlation between the value network's
+        predictions and the actual returns. Useful for detecting value
+        divergence that standard loss metrics do not surface.
+        """
+        last_values = last_values.squeeze(-1)
+        rewards = self.memory.get_tensor_by_name("rewards").squeeze(-1)
+        values = self.memory.get_tensor_by_name("values").squeeze(-1)[0]
+        terminated = self.memory.get_tensor_by_name("terminated").squeeze(-1)
+        truncated = self.memory.get_tensor_by_name("truncated").squeeze(-1)
+
+        shape = rewards.shape
+        true_values = torch.zeros(shape[1], device=self.device)
+        reset = torch.zeros(shape[1], device=self.device, dtype=torch.bool)
+        discount = 1.0
+
+        for t in range(shape[0]):
+            true_values += discount * rewards[t] * ~reset
+            reset |= (terminated[t] > 0) | (truncated[t] > 0)
+            discount *= self.cfg.discount_factor
+
+        true_values += discount * last_values * ~reset
+
+        self.track_data("Value / Prediction mean", values.mean().item())
+        self.track_data("Value / True value mean", true_values.mean().item())
+        self.track_data("Value / True value diff", (values.mean() - true_values.mean()).item())
+        self.track_data("Value / True value corr", torch.corrcoef(torch.stack((values, true_values)))[0, 1].item())
+
+        norm_values = torch.where(~reset, values - discount * last_values, values)
+        norm_true_values = torch.where(~reset, true_values - discount * last_values, true_values)
+        self.track_data(
+            "Value / True value corr norm", torch.corrcoef(torch.stack((norm_values, norm_true_values)))[0, 1].item()
+        )

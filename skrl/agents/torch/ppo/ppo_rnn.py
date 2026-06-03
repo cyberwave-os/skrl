@@ -591,5 +591,43 @@ class PPO_RNN(Agent):
 
         self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
 
+        self._get_additional_value_metrics(last_values)
+
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
+
+    def _get_additional_value_metrics(self, last_values: torch.Tensor) -> None:
+        """Track value prediction vs true discounted return correlation.
+
+        Computes the forward-looking discounted return over the rollout
+        horizon and reports Pearson correlation between the value network's
+        predictions and the actual returns.
+        """
+        last_values = last_values.squeeze(-1)
+        rewards = self.memory.get_tensor_by_name("rewards").squeeze(-1)
+        values = self.memory.get_tensor_by_name("values").squeeze(-1)[0]
+        terminated = self.memory.get_tensor_by_name("terminated").squeeze(-1)
+        truncated = self.memory.get_tensor_by_name("truncated").squeeze(-1)
+
+        shape = rewards.shape
+        true_values = torch.zeros(shape[1], device=self.device)
+        reset = torch.zeros(shape[1], device=self.device, dtype=torch.bool)
+        discount = 1.0
+
+        for t in range(shape[0]):
+            true_values += discount * rewards[t] * ~reset
+            reset |= (terminated[t] > 0) | (truncated[t] > 0)
+            discount *= self.cfg.discount_factor
+
+        true_values += discount * last_values * ~reset
+
+        self.track_data("Value / Prediction mean", values.mean().item())
+        self.track_data("Value / True value mean", true_values.mean().item())
+        self.track_data("Value / True value diff", (values.mean() - true_values.mean()).item())
+        self.track_data("Value / True value corr", torch.corrcoef(torch.stack((values, true_values)))[0, 1].item())
+
+        norm_values = torch.where(~reset, values - discount * last_values, values)
+        norm_true_values = torch.where(~reset, true_values - discount * last_values, true_values)
+        self.track_data(
+            "Value / True value corr norm", torch.corrcoef(torch.stack((norm_values, norm_true_values)))[0, 1].item()
+        )
