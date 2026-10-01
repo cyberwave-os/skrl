@@ -171,6 +171,10 @@ class PPO(Agent):
         super().init(trainer_cfg=trainer_cfg)
         self.enable_models_training_mode(False)
 
+        from skrl.trainers.torch.base import _gpu_mem_probe
+
+        _gpu_mem_probe("PPO before memory.create_tensor()")
+
         # create tensors in memory
         if self.memory is not None:
             self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
@@ -185,6 +189,8 @@ class PPO(Agent):
             self.memory.create_tensor(name="advantages", size=1, dtype=torch.float32)
 
             self._tensors_names = ["observations", "states", "actions", "log_prob", "values", "returns", "advantages"]
+
+        _gpu_mem_probe("PPO after memory.create_tensor()")
 
         # create temporary variables needed for storage and computation
         self._current_next_observations = None
@@ -319,11 +325,15 @@ class PPO(Agent):
         if self.training:
             self._rollout += 1
             if not self._rollout % self.cfg.rollouts and timestep >= self.cfg.learning_starts:
+                from skrl.trainers.torch.base import _gpu_mem_probe
+
+                _gpu_mem_probe(f"PPO before update() [t={timestep}]")
                 with ScopedTimer() as timer:
                     self.enable_models_training_mode(True)
                     self.update(timestep=timestep, timesteps=timesteps)
                     self.enable_models_training_mode(False)
                     self.track_data("Stats / Algorithm update time (ms)", timer.elapsed_time_ms)
+                _gpu_mem_probe(f"PPO after update() [t={timestep}]")
 
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)
@@ -473,8 +483,6 @@ class PPO(Agent):
 
         self.track_data("Policy / Standard deviation", self.policy.distribution(role="policy").stddev.mean().item())
 
-        self._get_additional_value_metrics(last_values)
-
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
 
@@ -570,40 +578,3 @@ class PPO(Agent):
                 predicted_values - sampled_values, min=-self.cfg.value_clip, max=self.cfg.value_clip
             )
         return self.cfg.value_loss_scale * F.mse_loss(sampled_returns, predicted_values)
-
-    def _get_additional_value_metrics(self, last_values: torch.Tensor) -> None:
-        """Track value prediction vs true discounted return correlation.
-
-        Computes the forward-looking discounted return over the rollout
-        horizon and reports Pearson correlation between the value network's
-        predictions and the actual returns. Useful for detecting value
-        divergence that standard loss metrics do not surface.
-        """
-        last_values = last_values.squeeze(-1)
-        rewards = self.memory.get_tensor_by_name("rewards").squeeze(-1)
-        values = self.memory.get_tensor_by_name("values").squeeze(-1)[0]
-        terminated = self.memory.get_tensor_by_name("terminated").squeeze(-1)
-        truncated = self.memory.get_tensor_by_name("truncated").squeeze(-1)
-
-        shape = rewards.shape
-        true_values = torch.zeros(shape[1], device=self.device)
-        reset = torch.zeros(shape[1], device=self.device, dtype=torch.bool)
-        discount = 1.0
-
-        for t in range(shape[0]):
-            true_values += discount * rewards[t] * ~reset
-            reset |= (terminated[t] > 0) | (truncated[t] > 0)
-            discount *= self.cfg.discount_factor
-
-        true_values += discount * last_values * ~reset
-
-        self.track_data("Value / Prediction mean", values.mean().item())
-        self.track_data("Value / True value mean", true_values.mean().item())
-        self.track_data("Value / True value diff", (values.mean() - true_values.mean()).item())
-        self.track_data("Value / True value corr", torch.corrcoef(torch.stack((values, true_values)))[0, 1].item())
-
-        norm_values = torch.where(~reset, values - discount * last_values, values)
-        norm_true_values = torch.where(~reset, true_values - discount * last_values, true_values)
-        self.track_data(
-            "Value / True value corr norm", torch.corrcoef(torch.stack((norm_values, norm_true_values)))[0, 1].item()
-        )

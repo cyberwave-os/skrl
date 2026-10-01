@@ -161,6 +161,10 @@ class SAC(Agent):
         super().init(trainer_cfg=trainer_cfg)
         self.enable_models_training_mode(False)
 
+        from skrl.trainers.torch.base import _gpu_mem_probe
+
+        _gpu_mem_probe("SAC before memory.create_tensor()")
+
         # create tensors in memory
         if self.memory is not None:
             self.memory.create_tensor(name="observations", size=self.observation_space, dtype=torch.float32)
@@ -180,6 +184,8 @@ class SAC(Agent):
                 "next_states",
                 "terminated",
             ]
+
+        _gpu_mem_probe("SAC after memory.create_tensor()")
 
     def act(
         self, observations: torch.Tensor, states: torch.Tensor | None, *, timestep: int, timesteps: int
@@ -284,11 +290,17 @@ class SAC(Agent):
         """
         if self.training:
             if timestep >= self.cfg.learning_starts:
+                from skrl.trainers.torch.base import _gpu_mem_probe
+
+                if timestep <= self.cfg.learning_starts + 2:
+                    _gpu_mem_probe(f"SAC before update() [t={timestep}]")
                 with ScopedTimer() as timer:
                     self.enable_models_training_mode(True)
                     self.update(timestep=timestep, timesteps=timesteps)
                     self.enable_models_training_mode(False)
                     self.track_data("Stats / Algorithm update time (ms)", timer.elapsed_time_ms)
+                if timestep <= self.cfg.learning_starts + 2:
+                    _gpu_mem_probe(f"SAC after update() [t={timestep}]")
 
         # write tracking data and checkpoints
         super().post_interaction(timestep=timestep, timesteps=timesteps)

@@ -14,6 +14,30 @@ from skrl.envs.wrappers.torch import MultiAgentEnvWrapper, Wrapper
 from skrl.multi_agents.torch import MultiAgent
 from skrl.utils import ScopedTimer
 
+import os as _os
+
+_GPU_MEM_PROBE_ENABLED = _os.environ.get("CW_GPU_MEM_PROBE", "") != "0"
+_GPU_MEM_PROBE_STEPS = 3  # how many update boundaries to log
+
+
+def _gpu_mem_probe(label: str) -> None:
+    """Log CUDA memory at a labelled training boundary.
+
+    Reports allocated (active tensors), reserved (allocator cache), and
+    the high-water mark.  All values in MiB.  Only fires when CUDA is
+    available and ``CW_GPU_MEM_PROBE`` is not ``"0"``.
+    """
+    if not _GPU_MEM_PROBE_ENABLED or not torch.cuda.is_available():
+        return
+    torch.cuda.synchronize()
+    alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+    resv = torch.cuda.memory_reserved() / (1024 ** 2)
+    peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    print(
+        f"[GPU-MEM] {label:.<50s} "
+        f"alloc={alloc:,.0f} MiB  resv={resv:,.0f} MiB  peak={peak:,.0f} MiB"
+    )
+
 
 def generate_equally_spaced_scopes(*, num_envs: int, num_simultaneous_agents: int) -> list[int]:
     """Generate a list of equally spaced scopes for simultaneous agents.
@@ -195,8 +219,12 @@ class Trainer(ABC):
         )
 
         # reset the environments
+        _gpu_mem_probe("before env.reset()")
         observations, infos = self.env.reset()
         states = self.env.state()
+        _gpu_mem_probe("after env.reset()")
+
+        _mem_updates_logged = 0
 
         for timestep in tqdm.tqdm(range(self.cfg.timesteps), disable=self.cfg.disable_progressbar, file=sys.stdout):
 
@@ -217,6 +245,9 @@ class Trainer(ABC):
                     next_states = self.env.state()
                     self.agents.track_data("Stats / Env stepping time (ms)", timer.elapsed_time_ms)
 
+                if timestep < 2:
+                    _gpu_mem_probe(f"after env.step() [t={timestep}]")
+
                 # render the environments
                 if not self.cfg.headless and not timestep % self.cfg.render_interval:
                     self.env.render()
@@ -236,14 +267,22 @@ class Trainer(ABC):
                     timesteps=self.cfg.timesteps,
                 )
 
+                if timestep < 2:
+                    _gpu_mem_probe(f"after record_transition [t={timestep}]")
+
                 # log environment info
                 if self.cfg.environment_info in infos:
                     for k, v in infos[self.cfg.environment_info].items():
                         if isinstance(v, torch.Tensor) and v.numel() == 1:
                             self.agents.track_data(k if "/" in k else f"Info / {k}", v.item())
 
-            # post-interaction
+            # post-interaction (PPO/SAC update happens inside here)
+            if _mem_updates_logged < _GPU_MEM_PROBE_STEPS:
+                _gpu_mem_probe(f"before post_interaction [t={timestep}]")
             self.agents.post_interaction(timestep=timestep, timesteps=self.cfg.timesteps)
+            if _mem_updates_logged < _GPU_MEM_PROBE_STEPS:
+                _gpu_mem_probe(f"after post_interaction [t={timestep}]")
+                _mem_updates_logged += 1
 
             # reset environments
             # - parallel/vectorized environments (single or multi-agent)
