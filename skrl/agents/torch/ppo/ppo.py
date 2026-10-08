@@ -383,6 +383,11 @@ class PPO(Agent):
             ):
 
                 with torch.autocast(device_type=self._device_type, enabled=self.cfg.mixed_precision):
+                    # Keep an un-preprocessed reference around so subclass
+                    # hooks (e.g. distillation against a teacher trained
+                    # on raw observations) can choose between raw and
+                    # preprocessed inputs without re-running the
+                    # preprocessor.
                     sampled_observations_raw = sampled_observations
                     sampled_states_raw = sampled_states
                     inputs = {
@@ -390,6 +395,10 @@ class PPO(Agent):
                         "states": self._state_preprocessor(sampled_states, train=not epoch),
                     }
 
+                    # compute policy loss via hook so subclasses can add
+                    # auxiliary terms (kickstarting / distillation /
+                    # behavioural cloning) without reimplementing the
+                    # full ``_update`` loop.
                     policy_loss, kl_divergence, entropy_loss, _ = self._compute_policy_loss(
                         inputs=inputs,
                         sampled_observations_raw=sampled_observations_raw,
@@ -404,6 +413,7 @@ class PPO(Agent):
                     if self.cfg.kl_threshold and kl_divergence > self.cfg.kl_threshold:
                         break
 
+                    # compute value loss via hook
                     value_loss = self._compute_value_loss(
                         inputs=inputs,
                         sampled_observations_raw=sampled_observations_raw,
@@ -468,6 +478,19 @@ class PPO(Agent):
         if self.scheduler:
             self.track_data("Learning / Learning rate", self.scheduler.get_last_lr()[0])
 
+    # ------------------------------------------------------------------
+    # Subclass extension hooks
+    #
+    # ``_compute_policy_loss`` and ``_compute_value_loss`` are called
+    # inside the per-mini-batch loop in ``_update``. They isolate the
+    # surrogate / entropy / value computation so subclasses (e.g.
+    # cyberwave-rl's auxiliary-loss and DAgger PPO runners) can add loss
+    # terms without copy-pasting the whole rollout-processing pipeline. This
+    # mirrors the hook contract that the private fork carried on top of
+    # upstream 1.4.3 and is preserved as a deliberate fork delta against
+    # upstream 2.1.0.
+    # ------------------------------------------------------------------
+
     def _compute_policy_loss(
         self,
         *,
@@ -478,10 +501,29 @@ class PPO(Agent):
         sampled_log_prob: torch.Tensor,
         sampled_advantages: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, "torch.Tensor | float", torch.Tensor]:
-        """Compute the PPO surrogate policy loss, KL divergence, and entropy loss.
+        """Compute the PPO surrogate policy loss + entropy + KL.
 
-        Returns ``(policy_loss, kl_divergence, entropy_loss, next_log_prob)``.
+        Returns ``(policy_loss, kl_divergence, entropy_loss, next_log_prob)``
+        where ``entropy_loss`` may be a Python scalar (``0``) when
+        ``cfg.entropy_loss_scale`` is zero, matching the existing
+        ``policy_loss + entropy_loss + value_loss`` accumulation in
+        ``_update``.
+
+        :param inputs: Preprocessed observation/state inputs already
+            run through ``self._observation_preprocessor`` /
+            ``self._state_preprocessor``.
+        :param sampled_observations_raw: Same observations as in
+            ``inputs["observations"]`` but *before* the observation
+            preprocessor. Provided so subclasses can pick whichever
+            representation matches the auxiliary teacher / target.
+        :param sampled_states_raw: Same as above for the state input.
+        :param sampled_actions: Actions taken in the mini-batch.
+        :param sampled_log_prob: Old policy log-probabilities for those
+            actions, used as the PPO importance-sampling denominator.
+        :param sampled_advantages: Advantage estimates for the
+            mini-batch (already normalised by ``compute_gae``).
         """
+
         _, outputs = self.policy.act({**inputs, "taken_actions": sampled_actions}, role="policy")
         next_log_prob = outputs["log_prob"]
 
@@ -496,9 +538,8 @@ class PPO(Agent):
 
         ratio = torch.exp(next_log_prob - sampled_log_prob)
         surrogate = sampled_advantages * ratio
-        surrogate_clipped = sampled_advantages * torch.clip(
-            ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip
-        )
+        surrogate_clipped = sampled_advantages * torch.clip(ratio, 1.0 - self.cfg.ratio_clip, 1.0 + self.cfg.ratio_clip)
+
         policy_loss = -torch.min(surrogate, surrogate_clipped).mean()
 
         return policy_loss, kl_divergence, entropy_loss, next_log_prob
@@ -512,7 +553,16 @@ class PPO(Agent):
         sampled_values: torch.Tensor,
         sampled_returns: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute the PPO value loss (clipped MSE against bootstrapped returns)."""
+        """Compute the PPO value loss (clipped MSE against bootstrapped returns).
+
+        :param inputs: Preprocessed inputs (same ``inputs`` dict
+            consumed by :meth:`_compute_policy_loss`).
+        :param sampled_observations_raw: Pre-preprocessor observations.
+        :param sampled_states_raw: Pre-preprocessor states.
+        :param sampled_values: Stored value predictions from rollout.
+        :param sampled_returns: Bootstrapped returns produced by GAE.
+        """
+
         predicted_values, _ = self.value.act(inputs, role="value")
 
         if self.cfg.value_clip > 0:
