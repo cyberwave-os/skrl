@@ -1,6 +1,9 @@
 [project]
+# Cyberwave fork, published to the internal Buildkite registry. It keeps the
+# name skrl so that rlmodule's skrl>=2.1 resolves to it; the .postN version is
+# upstream's plus our changes. Install it pinned (skrl==2.1.0.post3).
 name = "skrl"
-version = "2.1.0"
+version = "2.1.0.post3"
 description = "Modular and flexible library for reinforcement learning on PyTorch and JAX"
 readme = "README.md"
 requires-python = ">=3.10"

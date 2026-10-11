@@ -1,0 +1,72 @@
+# Publishes the Cyberwave fork of skrl (name `skrl`, version `<upstream>.postN`)
+# to the Buildkite `cyberwave-internal-python` registry.
+#
+# Tag `<upstream>-cyberwave.<N>` publishes version `<upstream>.post<N>`; the
+# tag and pyproject's version must agree, or the job fails before building.
+#
+# Install:
+#   pip install --extra-index-url \
+#     "https://buildkite:${TOKEN}@packages.buildkite.com/cyberwave/cyberwave-internal-python/pypi/simple" \
+#     skrl==2.1.0.post3
+#
+# Requires the BUILDKITE_API_TOKEN secret (write access to the registry).
+name: Publish to Buildkite
+
+on:
+  push:
+    tags:
+      - "*-cyberwave.*"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      BUILDKITE_ORG_SLUG: cyberwave
+      BUILDKITE_PYTHON_REGISTRY_SLUG: cyberwave-internal-python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.1"
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Check the tag matches the version
+        if: github.ref_type == 'tag'
+        run: |
+          VERSION="$(sed -nE 's/^version = "(.*)"$/\1/p' pyproject.toml | head -1)"
+          EXPECTED="$(echo "${GITHUB_REF_NAME}" | sed -E 's/^(.*)-cyberwave\.([0-9]+)$/\1.post\2/')"
+          if [ "${VERSION}" != "${EXPECTED}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} means version ${EXPECTED}, pyproject has ${VERSION}" >&2
+            exit 1
+          fi
+      - name: Build
+        run: uv build
+      # The fork's PPO loss hooks must be in the wheel: without them the
+      # cyberwave-rl aux-loss and DAgger PPO runners silently train plain PPO.
+      - name: Smoke test (wheel)
+        run: |
+          uv run --isolated --no-project --python 3.13 \
+            --index https://download.pytorch.org/whl/cpu \
+            --with "$(ls dist/*.whl)" --with torch \
+            python -c "from skrl.agents.torch.ppo import PPO; assert hasattr(PPO, '_compute_policy_loss') and hasattr(PPO, '_compute_value_loss')"
+      - name: Push to Buildkite
+        env:
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+        run: |
+          if [ -z "${BUILDKITE_API_TOKEN}" ]; then
+            echo "BUILDKITE_API_TOKEN is not set" >&2
+            exit 1
+          fi
+          API_URL="https://api.buildkite.com/v2/packages/organizations/${BUILDKITE_ORG_SLUG}/registries/${BUILDKITE_PYTHON_REGISTRY_SLUG}/packages"
+          for f in dist/*; do
+            CODE=$(curl -s -o response.txt -w "%{http_code}" -X POST "${API_URL}" \
+              -H "Authorization: Bearer ${BUILDKITE_API_TOKEN}" -F "file=@${f}")
+            if [ "${CODE}" -lt 200 ] || [ "${CODE}" -ge 300 ]; then
+              echo "Upload of ${f} failed (HTTP ${CODE}): $(cat response.txt)" >&2
+              exit 1
+            fi
+            echo "Uploaded $(basename "${f}")"
+          done
